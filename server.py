@@ -419,9 +419,11 @@ class TunnelSession:
 # ============================================================================
 
 class TunnelServer:
-    def __init__(self, config: ServerConfig, users: Dict[str, UserConfig]):
+    def __init__(self, config: ServerConfig, users: Dict[str, UserConfig], users_file: str):
         self.config = config
         self.users = users
+        self.users_file = users_file
+        self.users_mtime = self._get_users_mtime()
         self.ssl_context = self._create_ssl_context()
 
     def _create_ssl_context(self) -> ssl.SSLContext:
@@ -430,7 +432,27 @@ class TunnelServer:
         ctx.load_cert_chain(self.config.cert_file, self.config.key_file)
         return ctx
 
+    def _get_users_mtime(self) -> float:
+        try:
+            return os.path.getmtime(self.users_file)
+        except OSError:
+            return 0
+
+    def _reload_users_if_changed(self):
+        """Pick up users added/removed via smtp-tunnel-adduser/-deluser
+        without requiring a service restart."""
+        mtime = self._get_users_mtime()
+        if mtime == self.users_mtime:
+            return
+        try:
+            self.users = load_users(self.users_file)
+            self.users_mtime = mtime
+            logger.info(f"Users file changed, reloaded ({len(self.users)} users)")
+        except Exception as e:
+            logger.error(f"Failed to reload users file: {e}")
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self._reload_users_if_changed()
         session = TunnelSession(reader, writer, self.config, self.ssl_context, self.users)
         await session.run()
 
@@ -489,7 +511,7 @@ def main():
         logger.error(f"Certificate not found: {config.cert_file}")
         return 1
 
-    server = TunnelServer(config, users)
+    server = TunnelServer(config, users, users_file)
 
     try:
         asyncio.run(server.start())

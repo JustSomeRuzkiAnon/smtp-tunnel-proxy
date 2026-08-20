@@ -16,7 +16,7 @@ import tempfile
 import shutil
 
 # Add current directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from common import load_users, save_users, load_config, UserConfig
 
@@ -329,8 +329,8 @@ Examples:
 
     args = parser.parse_args()
 
-    # Get base directory (where this script is located)
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    # Get base directory (where this script is located).
+    base_dir = os.path.dirname(os.path.realpath(__file__))
 
     # Load existing users
     users_file = args.users_file

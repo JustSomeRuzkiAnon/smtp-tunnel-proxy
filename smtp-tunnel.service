@@ -1,6 +1,6 @@
 [Unit]
 Description=SMTP Tunnel Server
-Documentation=https://github.com/user/smtp-tunnel
+Documentation=https://github.com/JustSomeRuzkiAnon/smtp-tunnel-proxy
 After=network.target
 
 [Service]

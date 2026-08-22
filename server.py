@@ -21,6 +21,8 @@ import logging
 import argparse
 import struct
 import os
+import socket
+import time
 from typing import Dict, Optional
 from dataclasses import dataclass
 
@@ -45,6 +47,23 @@ FRAME_CONNECT = 0x02
 FRAME_CONNECT_OK = 0x03
 FRAME_CONNECT_FAIL = 0x04
 FRAME_CLOSE = 0x05
+FRAME_UDP_ASSOC = 0x06  # client->server: this channel_id is a UDP association
+FRAME_UDP = 0x07        # both ways: one datagram; payload = atyp+addr+port+data
+
+# SOCKS-style address atyp values used inside FRAME_UDP payloads
+ATYP_IPV4 = 0x01
+ATYP_DOMAIN = 0x03
+ATYP_IPV6 = 0x04
+
+UDP_ASSOC_IDLE_TIMEOUT = 60  # seconds
+
+
+def encode_udp_addr(ip: str, port: int) -> bytes:
+    """Build atyp+addr+port for a numeric IPv4/IPv6 source address."""
+    if ":" in ip:
+        return bytes([ATYP_IPV6]) + socket.inet_pton(socket.AF_INET6, ip) \
+            + struct.pack(">H", port)
+    return bytes([ATYP_IPV4]) + socket.inet_aton(ip) + struct.pack(">H", port)
 
 def make_frame(frame_type: int, channel_id: int, payload: bytes = b'') -> bytes:
     """Create a binary frame: type(1) + channel(2) + length(2) + payload"""
@@ -74,6 +93,63 @@ class Channel:
     connected: bool = False
 
 
+class UdpServerProtocol(asyncio.DatagramProtocol):
+    """Receives replies from real destinations and relays them to the client."""
+
+    def __init__(self, assoc: "UdpServerAssoc"):
+        self.assoc = assoc
+
+    def datagram_received(self, data: bytes, addr):
+        self.assoc.last_activity = time.monotonic()
+        ip, port = addr[0], addr[1]
+        try:
+            header = encode_udp_addr(ip, port)
+        except Exception:
+            return
+        payload = header + data
+        if len(payload) > 65535:
+            return
+        asyncio.ensure_future(
+            self.assoc.session._send_frame(FRAME_UDP, self.assoc.channel_id,
+                                           payload)
+        )
+
+
+class UdpServerAssoc:
+    """
+    One UDP association for a channel. Holds a per-family unconnected UDP socket
+    so a single association can talk to many destinations; the reply's source
+    address is preserved and sent back verbatim (natural NAT return path).
+    """
+
+    def __init__(self, session: "TunnelSession", channel_id: int):
+        self.session = session
+        self.channel_id = channel_id
+        self.transports: Dict[int, asyncio.DatagramTransport] = {}
+        self.last_activity = time.monotonic()
+
+    async def sendto(self, family: int, data: bytes, addr):
+        tr = self.transports.get(family)
+        if tr is None:
+            loop = asyncio.get_event_loop()
+            local = ("0.0.0.0", 0) if family == socket.AF_INET else ("::", 0)
+            tr, _ = await loop.create_datagram_endpoint(
+                lambda: UdpServerProtocol(self),
+                local_addr=local, family=family,
+            )
+            self.transports[family] = tr
+        tr.sendto(data, addr)
+        self.last_activity = time.monotonic()
+
+    def close(self):
+        for tr in self.transports.values():
+            try:
+                tr.close()
+            except Exception:
+                pass
+        self.transports.clear()
+
+
 # ============================================================================
 # Tunnel Session
 # ============================================================================
@@ -95,6 +171,8 @@ class TunnelSession:
         self.authenticated = False
         self.binary_mode = False
         self.channels: Dict[int, Channel] = {}
+        self.udp_assoc: Dict[int, UdpServerAssoc] = {}
+        self._udp_reaper: Optional[asyncio.Task] = None
         self.write_lock = asyncio.Lock()
 
         # User info (set after authentication)
@@ -296,6 +374,10 @@ class TunnelSession:
             await self._handle_data(channel_id, payload)
         elif frame_type == FRAME_CLOSE:
             await self._handle_close(channel_id)
+        elif frame_type == FRAME_UDP_ASSOC:
+            await self._handle_udp_assoc(channel_id)
+        elif frame_type == FRAME_UDP:
+            await self._handle_udp(channel_id, payload)
 
     async def _handle_connect(self, channel_id: int, payload: bytes):
         """Handle CONNECT request."""
@@ -353,6 +435,73 @@ class TunnelSession:
         channel = self.channels.get(channel_id)
         if channel:
             await self._close_channel(channel)
+        assoc = self.udp_assoc.pop(channel_id, None)
+        if assoc:
+            assoc.close()
+
+    async def _handle_udp_assoc(self, channel_id: int):
+        """Register a UDP association for this channel."""
+        if channel_id not in self.udp_assoc:
+            self.udp_assoc[channel_id] = UdpServerAssoc(self, channel_id)
+            logger.info(f"UDP ASSOC ch={channel_id}")
+            if self._udp_reaper is None:
+                self._udp_reaper = asyncio.create_task(self._reap_udp())
+
+    async def _handle_udp(self, channel_id: int, payload: bytes):
+        """Send one datagram from the client out to its destination."""
+        assoc = self.udp_assoc.get(channel_id)
+        if not assoc or len(payload) < 4:
+            return
+        atyp = payload[0]
+        idx = 1
+        try:
+            if atyp == ATYP_IPV4:
+                ip = socket.inet_ntoa(payload[idx:idx + 4]); idx += 4
+                family = socket.AF_INET
+            elif atyp == ATYP_IPV6:
+                ip = socket.inet_ntop(socket.AF_INET6, payload[idx:idx + 16])
+                idx += 16
+                family = socket.AF_INET6
+            elif atyp == ATYP_DOMAIN:
+                ln = payload[idx]; idx += 1
+                host = payload[idx:idx + ln].decode(); idx += ln
+                port = struct.unpack(">H", payload[idx:idx + 2])[0]; idx += 2
+                data = payload[idx:]
+                loop = asyncio.get_event_loop()
+                infos = await loop.getaddrinfo(host, port,
+                                               type=socket.SOCK_DGRAM)
+                if not infos:
+                    return
+                family = infos[0][0]
+                sockaddr = infos[0][4]
+                await assoc.sendto(family, data, sockaddr)
+                return
+            else:
+                return
+            port = struct.unpack(">H", payload[idx:idx + 2])[0]; idx += 2
+        except Exception:
+            return
+        data = payload[idx:]
+        try:
+            await assoc.sendto(family, data, (ip, port))
+        except Exception as e:
+            logger.debug(f"UDP sendto failed ch={channel_id}: {e}")
+
+    async def _reap_udp(self):
+        """Drop UDP associations idle longer than the timeout."""
+        try:
+            while True:
+                await asyncio.sleep(15)
+                now = time.monotonic()
+                stale = [cid for cid, a in self.udp_assoc.items()
+                         if now - a.last_activity > UDP_ASSOC_IDLE_TIMEOUT]
+                for cid in stale:
+                    assoc = self.udp_assoc.pop(cid, None)
+                    if assoc:
+                        assoc.close()
+                        logger.debug(f"UDP assoc ch={cid} idle-closed")
+        except asyncio.CancelledError:
+            pass
 
     async def _channel_reader(self, channel: Channel):
         """Read from destination and send to client."""
@@ -405,6 +554,12 @@ class TunnelSession:
 
     async def _cleanup(self):
         """Cleanup session."""
+        if self._udp_reaper:
+            self._udp_reaper.cancel()
+            self._udp_reaper = None
+        for assoc in list(self.udp_assoc.values()):
+            assoc.close()
+        self.udp_assoc.clear()
         for channel in list(self.channels.values()):
             await self._close_channel(channel)
         try:

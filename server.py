@@ -10,7 +10,7 @@ Protocol:
 3. Full-duplex binary protocol - no more SMTP overhead
 
 Features:
-- Multi-user support with per-user secrets
+- Multi-user with per-user secrets
 - Per-user IP whitelist
 - Per-user logging (optional)
 """
@@ -91,6 +91,11 @@ class Channel:
     reader: Optional[asyncio.StreamReader] = None
     writer: Optional[asyncio.StreamWriter] = None
     connected: bool = False
+    # Client->destination pump (head-of-line fix): incoming frames are queued
+    # and drained by a per-channel task, so one stalled destination can never
+    # park the shared session read loop.
+    out_queue: Optional[asyncio.Queue] = None
+    pump_task: Optional[asyncio.Task] = None
 
 
 class UdpServerProtocol(asyncio.DatagramProtocol):
@@ -386,48 +391,101 @@ class TunnelSession:
             host_len = payload[0]
             host = payload[1:1+host_len].decode('utf-8')
             port = struct.unpack('>H', payload[1+host_len:3+host_len])[0]
-
-            logger.info(f"CONNECT ch={channel_id} -> {host}:{port}")
-
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
-                    timeout=30.0
-                )
-
-                channel = Channel(
-                    channel_id=channel_id,
-                    host=host,
-                    port=port,
-                    reader=reader,
-                    writer=writer,
-                    connected=True
-                )
-                self.channels[channel_id] = channel
-
-                # Start reading from destination
-                asyncio.create_task(self._channel_reader(channel))
-
-                # Send success
-                await self._send_frame(FRAME_CONNECT_OK, channel_id)
-                logger.info(f"CONNECTED ch={channel_id}")
-
-            except Exception as e:
-                logger.error(f"Connect failed: {e}")
-                await self._send_frame(FRAME_CONNECT_FAIL, channel_id, str(e).encode()[:100])
-
         except Exception as e:
             logger.error(f"Handle connect error: {e}")
             await self._send_frame(FRAME_CONNECT_FAIL, channel_id)
+            return
+
+        logger.info(f"CONNECT ch={channel_id} -> {host}:{port}")
+
+        # Duplicate id (the client reused it after a lost/stale CLOSE): close
+        # the old channel first, otherwise its reader task keeps sending DATA
+        # with this id and two connections get interleaved on the client.
+        old = self.channels.get(channel_id)
+        if old:
+            logger.warning(
+                f"CONNECT ch={channel_id}: duplicate id, closing stale channel"
+            )
+            await self._close_channel(old)
+
+        # Register BEFORE connecting, so a CLOSE that races the connect (the
+        # client's connect timeout is shorter than ours) is honored instead of
+        # leaking a live destination connection on success.
+        channel = Channel(channel_id=channel_id, host=host, port=port)
+        self.channels[channel_id] = channel
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=30.0
+            )
+        except Exception as e:
+            logger.error(f"Connect failed: {e}")
+            if self.channels.get(channel_id) is channel:
+                self.channels.pop(channel_id, None)
+            await self._send_frame(FRAME_CONNECT_FAIL, channel_id, str(e).encode()[:100])
+            return
+
+        # Closed by the client while we were connecting: drop the result.
+        if self.channels.get(channel_id) is not channel:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
+        channel.reader = reader
+        channel.writer = writer
+        channel.connected = True
+        # Start reading from destination
+        asyncio.create_task(self._channel_reader(channel))
+        # And draining client->destination frames off the session loop
+        channel.out_queue = asyncio.Queue(maxsize=128)
+        channel.pump_task = asyncio.create_task(self._dest_pump(channel))
+
+        # Send success
+        await self._send_frame(FRAME_CONNECT_OK, channel_id)
+        logger.info(f"CONNECTED ch={channel_id}")
+
+    async def _dest_pump(self, channel: Channel):
+        """
+        Drain client->destination frames queued by _handle_data. Runs as its
+        own task so a stalled destination only parks this pump — never the
+        shared session read loop.
+        """
+        cid = channel.channel_id
+        broken = False
+        try:
+            while True:
+                data = await channel.out_queue.get()
+                channel.writer.write(data)
+                await channel.writer.drain()
+        except asyncio.CancelledError:
+            return  # _close_channel owns the rest
+        except Exception:
+            broken = True
+        channel.connected = False
+        self.channels.pop(cid, None)
+        if channel.writer:
+            try:
+                channel.writer.close()
+                await channel.writer.wait_closed()
+            except Exception:
+                pass
+        if broken:
+            await self._send_frame(FRAME_CLOSE, cid)
 
     async def _handle_data(self, channel_id: int, payload: bytes):
-        """Forward data to destination."""
+        """Forward data to destination (via the channel pump)."""
         channel = self.channels.get(channel_id)
-        if channel and channel.connected and channel.writer:
+        if channel and channel.connected and channel.out_queue is not None:
             try:
-                channel.writer.write(payload)
-                await channel.writer.drain()
-            except:
+                channel.out_queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                # Destination hopelessly stalled: kill this channel instead of
+                # freezing the whole session (head-of-line block).
+                await self._send_frame(FRAME_CLOSE, channel_id)
                 await self._close_channel(channel)
 
     async def _handle_close(self, channel_id: int):
@@ -538,19 +596,29 @@ class TunnelSession:
             pass
 
     async def _close_channel(self, channel: Channel):
-        """Close a channel."""
-        if not channel.connected:
+        """
+        Close a channel and drop it from the session. The identity check makes
+        this safe to call twice and for channels still mid-connect (no writer
+        yet); the pump, if running, is cancelled first so it doesn't write
+        into a closing socket.
+        """
+        if self.channels.get(channel.channel_id) is not channel:
             return
         channel.connected = False
-
+        self.channels.pop(channel.channel_id, None)
+        pump = channel.pump_task
+        if pump is not None and not pump.done():
+            pump.cancel()
+            try:
+                await pump
+            except BaseException:
+                pass
         if channel.writer:
             try:
                 channel.writer.close()
                 await channel.writer.wait_closed()
-            except:
+            except Exception:
                 pass
-
-        self.channels.pop(channel.channel_id, None)
 
     async def _cleanup(self):
         """Cleanup session."""
@@ -565,7 +633,7 @@ class TunnelSession:
         try:
             self.writer.close()
             await self.writer.wait_closed()
-        except:
+        except Exception:
             pass
 
 
